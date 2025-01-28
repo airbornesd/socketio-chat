@@ -1,4 +1,3 @@
-import { Server } from 'socket.io';
 import {
   ISocketCallback,
   IMessageData,
@@ -7,42 +6,14 @@ import {
 } from '../types/interfaces.js';
 import { logger, Message } from 'shared';
 import { Chat, redis } from 'shared';
-import { getIO } from '../utils/socket.js';
-
-// ---- SERVICES ---- //
-
-// let messageRateLimit = new Map();
-// let rateLimitWindow: NodeJS.Timeout;
-
-// const startRateLimitCleaner = () => {
-//   rateLimitWindow = setInterval(() => {
-//     messageRateLimit.clear();
-//   }, 60000);
-// };
-
-// // startRateLimitCleaner();
-
-// export const cleanup = () => {
-//   clearInterval(rateLimitWindow);
-//   messageRateLimit.clear();
-// };
-
-// const messageLimit = (user: string) => {
-//   const count = messageRateLimit.get(user) || 0;
-//   if (count >= 50) {
-//     return false;
-//   }
-//   messageRateLimit.set(user, count + 1);
-//   return true;
-// };
-
-// ---- SERVICES ---- //
+import { getIo } from '../utils/socket.js';
 
 export const socketResponse = (callback: ISocketCallback, event: string) => {
-  const io = getIO();
+  const io = getIo();
 
   return (response: { data: any; err?: Error }) => {
     if (response.err) {
+      console.log('🚀 ~ return ~ response.err:', response.err);
       return callback({
         success: false,
         message: response.err.message || 'an error occurred',
@@ -74,12 +45,26 @@ export const getUserChats = async (userId: string) => {
 
     const chats = await Chat.find({ members: userId })
       .sort({ updatedAt: -1 })
+      .populate('members', 'username')
       .lean()
       .exec();
 
-    await redis.setEx(cacheKey, 300, JSON.stringify(chats));
+    const lastMessages = await Promise.all(
+      chats.map(async (chat) => {
+        const message = await Message.findOne({ chatId: chat._id })
+          .sort({ createdAt: -1 })
+          .lean();
+        return message;
+      })
+    );
+    const enrichedChats = chats.map((chat, index) => ({
+      ...chat,
+      lastMessage: lastMessages[index],
+    }));
 
-    return { success: true, data: { chats } };
+    await redis.setEx(cacheKey, 300, JSON.stringify(enrichedChats));
+
+    return { success: true, data: { chats: enrichedChats } };
   } catch (error) {
     logger.error('error fetching user chats:', error);
 
@@ -98,9 +83,6 @@ export const sendMessage = async (
   try {
     const { chatId, text } = data;
 
-    // if (messageLimit(senderId))
-    //   return next({ data, err: new Error('message limit exceeded') });
-
     const chat = await Chat.findOne({
       _id: chatId,
       members: { $in: senderId },
@@ -108,24 +90,34 @@ export const sendMessage = async (
 
     if (!chat) return next({ data, err: new Error('chat not found') });
 
-    const [message] = await Promise.all([
-      Message.create({
-        content: text.trim(),
-        userId: senderId,
-        chatId: chat._id,
-      }),
-      Chat.updateOne({ _id: chatId }, { $set: { updatedAt: new Date() } }),
+    const message = await Message.create({
+      content: text.trim(),
+      userId: senderId,
+      chatId: chat._id,
+    });
+
+    await Promise.all([
+      Chat.updateOne(
+        { _id: chatId },
+        {
+          $set: {
+            updatedAt: new Date(),
+            lastMessage: message._id,
+          },
+        }
+      ),
+      ...chat.members.map((memberId) => redis.del(`user:${memberId}:chats`)),
     ]);
 
-    await Promise.all(
-      chat.members.map((memberId) => redis.del(`user:${memberId}:chats`))
-    );
+    const populatedMessage = await Message.findById(message._id)
+      .populate('userId', 'username avatar')
+      .lean();
 
     chat.members.forEach((memberId) => {
       next({
         data: {
           chatId,
-          data: message,
+          data: populatedMessage,
           userId: memberId.toString(),
           recipients: chat.members,
         },
@@ -160,13 +152,14 @@ export const readMessage = async (
         err: new Error('chat not found'),
       });
 
-    const [_, messages] = await Promise.all([
-      Message.updateMany(
-        { _id: { $in: messageIds } },
-        { $addToSet: { readBy: readerId } }
-      ),
-      Message.find({ _id: { $in: messageIds } }, {}, { lean: true }),
-    ]);
+    await Message.updateMany(
+      { _id: { $in: messageIds } },
+      { $addToSet: { readBy: readerId } }
+    );
+
+    const messages = await Message.find({ _id: { $in: messageIds } })
+      .populate('userId', 'username avatar')
+      .lean();
 
     chat.members.forEach((memberId) => {
       next({

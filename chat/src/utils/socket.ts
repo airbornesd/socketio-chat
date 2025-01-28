@@ -7,9 +7,9 @@ import { ISocket } from '../types/interfaces.js';
 import * as service from '../services/socket.js';
 
 let io: Server;
-const onlineUsers = new Map();
+const onlineUsers = new Map<string, Set<string>>();
 
-export const getIO = () => {
+export const getIo = () => {
   if (!io) {
     throw new Error('socket.io not initialized');
   }
@@ -17,9 +17,9 @@ export const getIO = () => {
 };
 
 export const initSocket = (server: IServer) => {
-  if (io) {
-    return io;
-  }
+  // if (io) {
+  //   return io;
+  // }
 
   io = new Server(server, {
     adapter: createAdapter(redis, redisSubClient),
@@ -35,7 +35,7 @@ export const initSocket = (server: IServer) => {
   io.use(checkSocketAuth);
 
   io.on('connection', (socket: ISocket) => {
-    const user = socket.user?._id.toString();
+    const user = socket.user;
 
     if (!user) return socket.disconnect();
 
@@ -43,13 +43,21 @@ export const initSocket = (server: IServer) => {
 
     if (!onlineUsers.has(user)) onlineUsers.set(user, new Set());
 
+    onlineUsers.get(user)?.add(socket.id);
+
+    // Emit online status to relevant users
+    emitUserStatus(user, true);
+
     socket.on('user_connected', (data, callback) => {
       validateSocket(user, callback, async () => {
         try {
           const response = await service.getUserChats(user);
-          if (response.success) {
-            io.to(user).emit('user_connected', response.data);
-          }
+          const onlineStatus = getOnlineUsers();
+
+          io.to(user).emit('login', {
+            ...response.data,
+            onlineUsers: onlineStatus,
+          });
         } catch (error) {
           socket.emit('error', {
             message: 'failed to fetch user chats',
@@ -59,6 +67,7 @@ export const initSocket = (server: IServer) => {
     });
 
     socket.on('send_message', (data, callback) => {
+      console.log('🚀 ~ socket.on ~ send_message:', data);
       validateSocket(user, callback, () => {
         const next = service.socketResponse(callback, 'receive_message');
         return service.sendMessage(data, user, next);
@@ -66,23 +75,41 @@ export const initSocket = (server: IServer) => {
     });
 
     socket.on('read_message', (data, callback) => {
+      console.log('🚀 ~ socket.on ~ read_message:', data);
       validateSocket(user, callback, () => {
         const next = service.socketResponse(callback, 'message_read');
         return service.readMessage(data, user, next);
       });
     });
 
+    socket.on('typing_status', (data) => {
+      const { chatId, isTyping } = data;
+      socket.to(chatId).emit('user_typing', {
+        userId: user,
+        chatId,
+        isTyping,
+      });
+    });
+
     socket.on('disconnect', () => {
       const userSockets = onlineUsers.get(user);
-
       if (userSockets) {
         userSockets.delete(socket.id);
         if (userSockets.size === 0) {
           onlineUsers.delete(user);
+          emitUserStatus(user, false);
         }
       }
     });
   });
 
   return io;
+};
+
+const emitUserStatus = (userId: string, isOnline: boolean) => {
+  io.emit('user_status', { userId, isOnline });
+};
+
+const getOnlineUsers = () => {
+  return Array.from(onlineUsers.keys());
 };

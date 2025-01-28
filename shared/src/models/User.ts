@@ -3,6 +3,8 @@ import mongoose, { Schema, Document, Model } from 'mongoose';
 export interface IUser extends Document {
   _id: mongoose.Types.ObjectId;
   username?: string;
+  email?: string;
+  bio?: string;
   password?: string;
   role: 'admin' | 'staff' | 'member';
   address?: string;
@@ -14,6 +16,8 @@ const schema = new Schema<IUser>(
   {
     username: { type: String, unique: true, sparse: true },
     password: { type: String },
+    email: { type: String },
+    bio: { type: String },
     role: {
       type: String,
       enum: ['admin', 'staff', 'member'],

@@ -12,7 +12,7 @@ export interface IRequest extends Request {
 }
 
 export interface ISocket extends Socket {
-  user?: IUser;
+  user?: string;
 }
 
 export type AnyDict = Record<string, any>;

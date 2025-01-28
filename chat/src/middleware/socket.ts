@@ -2,9 +2,10 @@ import jwt from 'jsonwebtoken';
 import { IUser, logger } from 'shared';
 import {
   ISocket,
-  SocketCallback,
+  ISocketCallback,
   ValidationCallback,
 } from '../types/interfaces';
+import { ObjectId } from 'mongoose';
 
 const secret = process.env.JWT_SECRET || '';
 
@@ -13,17 +14,18 @@ export const checkSocketAuth = (
   next: (err?: Error) => void
 ) => {
   try {
-    const token = socket.handshake.auth.token;
+    const token =
+      socket.handshake.auth?.token || socket.handshake.headers?.token;
     if (!token) {
       return next(new Error('authentication error: no token provided'));
     }
 
-    const decoded = jwt.verify(token, secret) as { user: IUser };
-    if (!decoded?.user) {
+    const decoded = jwt.verify(token, secret) as { _id: ObjectId };
+    if (!decoded?._id) {
       return next(new Error('authentication error: user not found'));
     }
 
-    socket.user = decoded.user;
+    socket.user = decoded?._id.toString();
     next();
   } catch (error) {
     next(new Error('authentication error: invalid token'));
@@ -32,7 +34,7 @@ export const checkSocketAuth = (
 
 export const validateSocket = (
   user: string | undefined,
-  callback: SocketCallback,
+  callback: ISocketCallback,
   operation: ValidationCallback
 ) => {
   if (!user) {

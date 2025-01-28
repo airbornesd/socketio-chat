@@ -5,7 +5,7 @@ import { errorMiddleware, notFoundMiddleware } from './middleware/error.js';
 import { cors, logger } from 'shared';
 import routes from './routes/index.js';
 import { boot } from './services/boot.js';
-import { getIO, initSocket } from './utils/socket.js';
+import { initSocket } from './utils/socket.js';
 import { createServer } from 'http';
 
 const app = express();
@@ -20,7 +20,7 @@ app.use(
 );
 
 app.use((req, res, next) => {
-  console.log(req.method + ' -- ' + req.path);
+  logger.info(req.method + ' ' + req.path);
   next();
 });
 
@@ -29,8 +29,8 @@ app.use(routes);
 app.use(notFoundMiddleware);
 app.use(errorMiddleware);
 
-initSocket(server);
-app.locals.io = getIO();
+const io = initSocket(server);
+app.set('io', io);
 
 const port = process.env.PORT || 80;
 
