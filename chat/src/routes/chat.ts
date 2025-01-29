@@ -16,5 +16,6 @@ router.post(
   validate(validation.removeMember),
   controller.removeMember
 );
+router.post('/redis', controller.clearAllCache);
 
 export default router;

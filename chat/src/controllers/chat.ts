@@ -1,6 +1,6 @@
-import { Response } from 'express';
+import { Request, Response } from 'express';
 import { AnyDict, IRequest } from '../types/interfaces';
-import { Chat, Message, sendResponse, User } from 'shared';
+import { Chat, Message, redis, sendResponse, User } from 'shared';
 import { Types } from 'mongoose';
 
 export const createChat = async (req: IRequest, res: Response) => {
@@ -160,4 +160,9 @@ export const getChatById = async (req: IRequest, res: Response) => {
     .lean();
 
   sendResponse(res, 200, 'success', messages);
+};
+
+export const clearAllCache = async (req: Request, res: Response) => {
+  const answer = await redis.flushAll();
+  sendResponse(res, 200, 'success', answer);
 };

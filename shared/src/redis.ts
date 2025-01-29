@@ -2,7 +2,7 @@ import { createClient } from 'redis';
 import logger from './logger.js';
 
 export const redis = createClient({
-  url: 'redis://localhost:6379', // adjust URL as needed
+  url: 'redis://localhost:6379',
 });
 
 export const redisPubClient = redis.duplicate();

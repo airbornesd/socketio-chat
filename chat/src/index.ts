@@ -7,7 +7,7 @@ import express, {
   Response,
 } from 'express';
 import { errorMiddleware, notFoundMiddleware } from './middleware/error.js';
-import { cors, logger } from 'shared';
+import { cors, logger, redis } from 'shared';
 import routes from './routes/index.js';
 import { boot } from './services/boot.js';
 import { initSocket } from './socket.js';
