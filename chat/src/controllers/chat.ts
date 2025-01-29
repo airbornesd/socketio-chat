@@ -154,7 +154,10 @@ export const getChats = async (req: IRequest, res: Response) => {
 export const getChatById = async (req: IRequest, res: Response) => {
   const chatId = req.params.id;
 
-  const messages = await Message.find({ chatId }).sort({ sentAt: -1 });
+  const messages = await Message.find({ chatId })
+    .sort({ sentAt: -1 })
+    .populate('userId', 'username')
+    .lean();
 
   sendResponse(res, 200, 'success', messages);
 };
