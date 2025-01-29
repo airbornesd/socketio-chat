@@ -13,18 +13,11 @@ import { Server } from 'socket.io';
 import { checkSocketAuth } from './middleware/socket.js';
 import { ISocket } from './types/interfaces.js';
 import { instrument } from '@socket.io/admin-ui';
-import {
-  BATCH_FLUSH_INTERVAL,
-  flush,
-  MESSAGE_BATCH_SIZE,
-  OFFLINE_MESSAGE_EXPIRY,
-  retry,
-} from './utils/socket.js';
+import { retry } from './utils/socket.js';
 import { Types } from 'mongoose';
 
 let io: Server;
-const onlineUsers = new Map<string, Set<string>>();
-const messageQueue = new Map<string, NodeJS.Timeout>();
+const onlineUsers = new Map();
 
 export const getIo = () => {
   if (!io) {
@@ -50,11 +43,11 @@ export const initSocket = (server: IServer) => {
     connectRedis();
     io.adapter(createAdapter(redisPubClient, redisSubClient));
   } catch (err) {
-    logger.error('Error connecting to Redis:', err);
+    logger.error('error connecting to Redis:', err);
   }
 
   io.engine.on('connection_error', (err) => {
-    console.log('Connection Error:', err);
+    logger.error('connection error:', err);
   });
 
   instrument(io, {
@@ -66,74 +59,19 @@ export const initSocket = (server: IServer) => {
 
   io.on('connection', (socket: ISocket) => {
     const user = socket.user;
-
     if (!user) return socket.disconnect();
 
     logger.info(`new socket connection: ${socket.id}`);
-
     socket.join(user);
 
     if (!onlineUsers.has(user)) onlineUsers.set(user, new Set());
     onlineUsers.get(user)?.add(socket.id);
 
-    (async () => {
+    socket.on('user_connected', async () => {
       try {
-        const offlineQueueKey = `offline_messages:${user}`;
-        const offlineMessages = await redis.lRange(offlineQueueKey, 0, -1);
-
-        if (offlineMessages.length > 0) {
-          const messages = offlineMessages.map((msg) => JSON.parse(msg));
-          socket.emit('offline_messages', messages);
-          await redis.del(offlineQueueKey);
-        }
+        io.emit('user_status', { userId: user, isOnline: true });
       } catch (error) {
-        logger.error('error processing offline messages:', error);
-      }
-    })();
-
-    io.emit('user_status', { userId: user, isOnline: true });
-
-    socket.on('user_connected', async (data) => {
-      if (!user) return { success: false, message: 'unauthorized' };
-
-      try {
-        const cacheKey = `user:${user}:chats`;
-        const cachedChats = await redis.get(cacheKey);
-
-        let chats;
-        if (cachedChats) {
-          chats = JSON.parse(cachedChats);
-        } else {
-          chats = await Chat.find({ members: user })
-            .sort({ updatedAt: -1 })
-            .populate('members', 'username')
-            .lean()
-            .exec();
-
-          const data = await Promise.all(
-            chats.map(async (chat) => {
-              const messages = await Message.find({ chatId: chat._id })
-                .sort({ createdAt: -1 })
-                .populate('userId', 'username')
-                .lean();
-
-              return {
-                chat,
-                messages,
-              };
-            })
-          );
-
-          chats = data;
-          await redis.setEx(cacheKey, 300, JSON.stringify(chats));
-        }
-
-        io.to(user).emit('login', { chats });
-      } catch (error) {
-        logger.error('error fetching user chats:', error);
-        socket.emit('error', {
-          message: 'failed to fetch user chats',
-        });
+        logger.error('Error in user_connected:', error);
       }
     });
 
@@ -142,14 +80,9 @@ export const initSocket = (server: IServer) => {
 
       try {
         const { chatId, text } = data;
-
-        const chat = await retry(async () =>
-          Chat.findOne({
-            _id: chatId,
-            members: { $in: user },
-          })
+        const chat = await retry(() =>
+          Chat.findOne({ _id: chatId, members: { $in: user } })
         );
-
         if (!chat) return { success: false, message: 'chat not found' };
 
         const message = await Message.create({
@@ -158,40 +91,21 @@ export const initSocket = (server: IServer) => {
           chatId: chat._id,
         });
 
-        const batchKey = `message_batch:${chatId}`;
-        await redis.rPush(batchKey, JSON.stringify(message));
-
-        if (!messageQueue.has(chatId)) {
-          const timeoutId = setTimeout(async () => {
-            await flush(chatId);
-            messageQueue.delete(chatId);
-          }, BATCH_FLUSH_INTERVAL);
-
-          messageQueue.set(chatId, timeoutId);
-        }
-
-        if ((await redis.lLen(batchKey)) >= MESSAGE_BATCH_SIZE) {
-          clearTimeout(messageQueue.get(chatId));
-          messageQueue.delete(chatId);
-          await flush(chatId);
-        }
+        await redis.xAdd(`chat:${chatId}:stream`, '*', {
+          message: JSON.stringify(message),
+        });
 
         await Promise.all([
           Chat.updateOne(
             { _id: chatId },
-            {
-              $set: {
-                updatedAt: new Date(),
-                lastMessage: message._id,
-              },
-            }
+            { $set: { updatedAt: new Date(), lastMessage: message._id } }
           ),
           ...chat.members.map((memberId: string | Types.ObjectId) =>
             redis.del(`user:${memberId}:chats`)
           ),
         ]);
 
-        const populate = await Message.findById(message._id)
+        const populatedMessage = await Message.findById(message._id)
           .populate('userId', 'username')
           .lean();
 
@@ -200,28 +114,22 @@ export const initSocket = (server: IServer) => {
           if (onlineUsers.has(memberIdStr)) {
             io.to(memberIdStr).emit('receive_message', {
               chatId,
-              data: populate,
-              userId: memberIdStr,
-              recipients: chat.members,
+              data: populatedMessage,
             });
           } else {
-            const offlineQueueKey = `offline_messages:${memberIdStr}`;
-            await redis.lPush(
-              offlineQueueKey,
-              JSON.stringify({
-                type: 'message',
+            await redis.xAdd(`offline_messages:${memberIdStr}`, '*', {
+              message: JSON.stringify({
                 chatId,
-                data: populate,
+                data: populatedMessage,
                 timestamp: Date.now(),
-              })
-            );
-            await redis.expire(offlineQueueKey, OFFLINE_MESSAGE_EXPIRY);
+              }),
+            });
           }
         }
 
-        return { success: true, data: populate };
+        return { success: true, data: populatedMessage };
       } catch (error) {
-        logger.error('error in sendMessage:', error);
+        logger.error('Error in sendMessage:', error);
         return {
           success: false,
           message: error instanceof Error ? error.message : 'error occurred',
@@ -229,17 +137,9 @@ export const initSocket = (server: IServer) => {
       }
     });
 
-    socket.on('read_message', async (data) => {
-      if (!user) return { success: false, message: 'unauthorized' };
-
+    socket.on('read_message', async ({ chatId }) => {
       try {
-        const { chatId } = data;
-
-        const chat = await Chat.findOne({
-          _id: chatId,
-          members: user,
-        }).lean();
-
+        const chat = await Chat.findOne({ _id: chatId, members: user }).lean();
         if (!chat) return { success: false, message: 'chat not found' };
 
         await Message.updateMany(
@@ -247,74 +147,39 @@ export const initSocket = (server: IServer) => {
           { $addToSet: { readBy: user } }
         );
 
-        const messages = await Message.find({ chatId, readBy: user })
-          .populate('userId', 'username')
-          .lean();
-
-        chat.members.forEach((memberId) => {
-          io.to(memberId.toString()).emit('message_read', {
-            chatId,
-            userId: memberId.toString(),
-            messages,
-            recipients: chat.members,
-          });
+        io.to(chat.members.map((m) => m.toString())).emit('message_read', {
+          chatId,
+          userId: user,
         });
-
-        ({ success: true, data: messages });
       } catch (error) {
-        logger.error('error in readMessage:', error);
-        ({
-          success: false,
-          message: error instanceof Error ? error.message : 'error occurred',
-        });
+        logger.error('Error in readMessage:', error);
       }
     });
 
-    socket.on('typing_status', async (data) => {
-      if (!user) return { success: false, message: 'unauthorized' };
+    socket.on('typing_status', async ({ chatId, isTyping }) => {
+      const chat = await Chat.findOne({ _id: chatId, members: user }).lean();
+      if (!chat) return;
 
-      try {
-        const { chatId, isTyping } = data;
-
-        const chat = await Chat.findOne({
-          _id: chatId,
-          members: user,
-        }).lean();
-
-        if (!chat) return { success: false, message: 'chat not found' };
-
-        chat.members.forEach((memberId) => {
-          if (memberId.toString() !== user) {
-            io.to(memberId.toString()).emit('user_typing', {
-              userId: user,
-              chatId,
-              isTyping,
-            });
-          }
-        });
-
-        return { success: true };
-      } catch (error) {
-        logger.error('error in typing status:', error);
-        return {
-          success: false,
-          message: error instanceof Error ? error.message : 'error occurred',
-        };
-      }
+      chat.members.forEach((memberId: string | Types.ObjectId) => {
+        if (memberId.toString() !== user) {
+          io.to(memberId.toString()).emit('user_typing', {
+            userId: user,
+            chatId,
+            isTyping,
+          });
+        }
+      });
     });
 
     socket.on('disconnect', () => {
       try {
         const userSockets = onlineUsers.get(user);
-
         if (userSockets) {
           userSockets.delete(socket.id);
           logger.info(`socket ${socket.id} disconnected for user ${user}`);
-
           if (userSockets.size === 0) {
             onlineUsers.delete(user);
             io.emit('user_status', { userId: user, isOnline: false });
-            logger.info(`user ${user} went offline (all sockets disconnected)`);
           }
         }
       } catch (error) {
